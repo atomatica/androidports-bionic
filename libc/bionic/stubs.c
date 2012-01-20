@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <ctype.h>
+#include <string.h>
 
 static int do_getpw_r(int by_name, const char* name, uid_t uid,
         struct passwd* dst, char* buf, size_t byte_count, struct passwd** result)
@@ -323,6 +324,35 @@ app_id_to_group(gid_t  gid, stubs_state_t*  state)
     return gr;
 }
 
+static struct passwd*
+pwd_lookup(struct passwd* pw, int by_name, const char* name, uid_t uid)
+{
+    FILE* db = fopen("/system/etc/passwd", "r");
+    if (db == NULL) return NULL;
+
+    char buf[500];
+    char *pch;
+
+    while(fgets(buf, 500, db) != NULL) {
+        pch = strtok(buf, ":");
+        while (pch != NULL) {
+            pch = strtok(NULL, ":");
+        }
+    }
+
+    if (by_name) {
+
+    }
+
+    pw->pw_name  = (char*)iinfo->name;
+    pw->pw_uid   = iinfo->aid;
+    pw->pw_gid   = iinfo->aid;
+    pw->pw_dir   = "/";
+    pw->pw_shell = "/system/bin/sh";
+
+    fclose(db);
+    return pw;
+}
 
 struct passwd*
 getpwuid(uid_t uid)
@@ -335,7 +365,10 @@ getpwuid(uid_t uid)
 
     pw = &state->passwd;
 
-    if ( android_id_to_passwd(pw, uid) != NULL )
+    if (pwd_lookup(pw, 0, NULL, uid) != NULL)
+        return pw;
+
+    if (android_id_to_passwd(pw, uid) != NULL)
         return pw;
 
     return app_id_to_passwd(uid, state);
@@ -349,10 +382,15 @@ getpwnam(const char *login)
     if (state == NULL)
         return NULL;
 
-    if (android_name_to_passwd(&state->passwd, login) != NULL)
-        return &state->passwd;
+    pw = &state->passwd;
 
-    return app_id_to_passwd( app_id_from_name(login), state );
+    if (pwd_lookup(pw, 1, login, 0) != NULL)
+        return pw;
+
+    if (android_name_to_passwd(pw, login) != NULL)
+        return pw;
+
+    return app_id_to_passwd(app_id_from_name(login), state);
 }
 
 int
