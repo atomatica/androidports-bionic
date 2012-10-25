@@ -774,6 +774,22 @@ void* dlrealloc(void*, size_t);
 void* dlmemalign(size_t, size_t);
 
 /*
+  int posix_memalign(void **memptr, size_t alignment, size_t size);
+  Places a pointer to a newly allocated chunk of size bytes, aligned
+  in accord with the alignment argument, in *memptr.
+
+  The return value is 0 on success, and ENOMEM on failure.
+
+  The alignment argument should be a power of two. If the argument is
+  not a power of two, the nearest greater power is used.
+  8-byte alignment is guaranteed by normal malloc calls, so don't
+  bother calling memalign with an argument of 8 or less.
+
+  Overreliance on posix_memalign is a sure way to fragment space.
+*/
+int posix_memalign(void **memptr, size_t alignment, size_t size);
+
+/*
   valloc(size_t n);
   Equivalent to memalign(pagesize, n), where pagesize is the page
   size of the system. If the pagesize is unknown, 4096 is used.
@@ -2274,7 +2290,22 @@ static void reset_on_error(mstate m);
 
 #  include <private/logd.h>
 
-static void __bionic_heap_error(const char* msg, const char* function)
+/* Convert a pointer into hex string */
+static void __bionic_itox(char* hex, void* ptr)
+{
+    intptr_t val = (intptr_t) ptr;
+    /* Terminate with NULL */
+    hex[8] = 0;
+    int i;
+
+    for (i = 7; i >= 0; i--) {
+        int digit = val & 15;
+        hex[i] = (digit <= 9) ? digit + '0' : digit - 10 + 'a';
+        val >>= 4;
+    }
+}
+
+static void __bionic_heap_error(const char* msg, const char* function, void* p)
 {
     /* We format the buffer explicitely, i.e. without using snprintf()
      * which may use malloc() internally. Not something we can trust
@@ -2287,23 +2318,33 @@ static void __bionic_heap_error(const char* msg, const char* function)
         strlcat(buffer, " IN ", sizeof(buffer));
         strlcat(buffer, function, sizeof(buffer));
     }
+
+    if (p != NULL) {
+        char hexbuffer[9];
+        __bionic_itox(hexbuffer, p);
+        strlcat(buffer, " addr=0x", sizeof(buffer));
+        strlcat(buffer, hexbuffer, sizeof(buffer));
+    }
+
     __libc_android_log_write(ANDROID_LOG_FATAL,"libc",buffer);
-    abort();
+
+    /* So that we can get a memory dump around p */
+    *((int **) 0xdeadbaad) = (int *) p;
 }
 
 #  ifndef CORRUPTION_ERROR_ACTION
-#    define CORRUPTION_ERROR_ACTION(m)  \
-    __bionic_heap_error("HEAP MEMORY CORRUPTION", __FUNCTION__)
+#    define CORRUPTION_ERROR_ACTION(m,p)  \
+    __bionic_heap_error("HEAP MEMORY CORRUPTION", __FUNCTION__, p)
 #  endif
 #  ifndef USAGE_ERROR_ACTION
 #    define USAGE_ERROR_ACTION(m,p)   \
-    __bionic_heap_error("INVALID HEAP ADDRESS", __FUNCTION__)
+    __bionic_heap_error("INVALID HEAP ADDRESS", __FUNCTION__, p)
 #  endif
 
 #else /* !LOG_ON_HEAP_ERROR */
 
 #  ifndef CORRUPTION_ERROR_ACTION
-#    define CORRUPTION_ERROR_ACTION(m) ABORT
+#    define CORRUPTION_ERROR_ACTION(m,p) ABORT
 #  endif /* CORRUPTION_ERROR_ACTION */
 
 #  ifndef USAGE_ERROR_ACTION
@@ -3040,7 +3081,7 @@ static void internal_malloc_stats(mstate m) {
   else if (RTCHECK(ok_address(M, B->fd)))\
     F = B->fd;\
   else {\
-    CORRUPTION_ERROR_ACTION(M);\
+    CORRUPTION_ERROR_ACTION(M, B);\
   }\
   B->fd = P;\
   F->bk = P;\
@@ -3057,7 +3098,7 @@ static void internal_malloc_stats(mstate m) {
   mchunkptr B = P->bk;\
   bindex_t I = small_index(S);\
   if (__builtin_expect (F->bk != P || B->fd != P, 0))\
-    CORRUPTION_ERROR_ACTION(M);\
+    CORRUPTION_ERROR_ACTION(M, P);\
   assert(P != B);\
   assert(P != F);\
   assert(chunksize(P) == small_index2size(I));\
@@ -3069,7 +3110,7 @@ static void internal_malloc_stats(mstate m) {
     B->fd = F;\
   }\
   else {\
-    CORRUPTION_ERROR_ACTION(M);\
+    CORRUPTION_ERROR_ACTION(M, P);\
   }\
 }
 
@@ -3080,7 +3121,7 @@ static void internal_malloc_stats(mstate m) {
 #define unlink_first_small_chunk(M, B, P, I) {\
   mchunkptr F = P->fd;\
   if (__builtin_expect (F->bk != P || B->fd != P, 0))\
-    CORRUPTION_ERROR_ACTION(M);\
+    CORRUPTION_ERROR_ACTION(M, P);\
   assert(P != B);\
   assert(P != F);\
   assert(chunksize(P) == small_index2size(I));\
@@ -3091,7 +3132,7 @@ static void internal_malloc_stats(mstate m) {
     F->bk = B;\
   }\
   else {\
-    CORRUPTION_ERROR_ACTION(M);\
+    CORRUPTION_ERROR_ACTION(M, P);\
   }\
 }
 
@@ -3140,7 +3181,7 @@ static void internal_malloc_stats(mstate m) {
           break;\
         }\
         else {\
-          CORRUPTION_ERROR_ACTION(M);\
+          CORRUPTION_ERROR_ACTION(M, C);\
           break;\
         }\
       }\
@@ -3154,7 +3195,7 @@ static void internal_malloc_stats(mstate m) {
           break;\
         }\
         else {\
-          CORRUPTION_ERROR_ACTION(M);\
+          CORRUPTION_ERROR_ACTION(M, F);\
           break;\
         }\
       }\
@@ -3189,13 +3230,13 @@ static void internal_malloc_stats(mstate m) {
     tchunkptr F = X->fd;\
     R = X->bk;\
     if (__builtin_expect (F->bk != X || R->fd != X, 0))\
-      CORRUPTION_ERROR_ACTION(M);\
+      CORRUPTION_ERROR_ACTION(M, X);\
     if (RTCHECK(ok_address(M, F))) {\
       F->bk = R;\
       R->fd = F;\
     }\
     else {\
-      CORRUPTION_ERROR_ACTION(M);\
+      CORRUPTION_ERROR_ACTION(M, F);\
     }\
   }\
   else {\
@@ -3210,7 +3251,7 @@ static void internal_malloc_stats(mstate m) {
       if (RTCHECK(ok_address(M, RP)))\
         *RP = 0;\
       else {\
-        CORRUPTION_ERROR_ACTION(M);\
+        CORRUPTION_ERROR_ACTION(M, RP);\
       }\
     }\
   }\
@@ -3227,7 +3268,7 @@ static void internal_malloc_stats(mstate m) {
         XP->child[1] = R;\
     }\
     else\
-      CORRUPTION_ERROR_ACTION(M);\
+      CORRUPTION_ERROR_ACTION(M, XP);\
     if (R != 0) {\
       if (RTCHECK(ok_address(M, R))) {\
         tchunkptr C0, C1;\
@@ -3238,7 +3279,7 @@ static void internal_malloc_stats(mstate m) {
             C0->parent = R;\
           }\
           else\
-            CORRUPTION_ERROR_ACTION(M);\
+            CORRUPTION_ERROR_ACTION(M, C0);\
         }\
         if ((C1 = X->child[1]) != 0) {\
           if (RTCHECK(ok_address(M, C1))) {\
@@ -3246,11 +3287,11 @@ static void internal_malloc_stats(mstate m) {
             C1->parent = R;\
           }\
           else\
-            CORRUPTION_ERROR_ACTION(M);\
+            CORRUPTION_ERROR_ACTION(M, C1);\
         }\
       }\
       else\
-        CORRUPTION_ERROR_ACTION(M);\
+        CORRUPTION_ERROR_ACTION(M, R);\
     }\
   }\
 }
@@ -3316,7 +3357,7 @@ static void* mmap_alloc(mstate m, size_t nb) {
       chunk_plus_offset(p, psize)->head = FENCEPOST_HEAD;
       chunk_plus_offset(p, psize+SIZE_T_SIZE)->head = 0;
 
-      if (mm < m->least_addr)
+      if (m->least_addr == 0 || mm < m->least_addr)
         m->least_addr = mm;
       if ((m->footprint += mmsize) > m->max_footprint)
         m->max_footprint = m->footprint;
@@ -3662,7 +3703,9 @@ static void* sys_alloc(mstate m, size_t nb) {
       m->max_footprint = m->footprint;
 
     if (!is_initialized(m)) { /* first-time initialization */
-      m->seg.base = m->least_addr = tbase;
+      if (m->least_addr == 0 || tbase < m->least_addr)
+        m->least_addr = tbase;
+      m->seg.base = tbase;
       m->seg.size = tsize;
       m->seg.sflags = mmap_flag;
       m->magic = mparams.magic;
@@ -3899,7 +3942,7 @@ static void* tmalloc_large(mstate m, size_t nb) {
         return chunk2mem(v);
       }
     }
-    CORRUPTION_ERROR_ACTION(m);
+    CORRUPTION_ERROR_ACTION(m, v);
   }
   return 0;
 }
@@ -3939,7 +3982,7 @@ static void* tmalloc_small(mstate m, size_t nb) {
     }
   }
 
-  CORRUPTION_ERROR_ACTION(m);
+  CORRUPTION_ERROR_ACTION(m, v);
   return 0;
 }
 
@@ -4505,6 +4548,18 @@ void* dlrealloc(void* oldmem, size_t bytes) {
 
 void* dlmemalign(size_t alignment, size_t bytes) {
   return internal_memalign(gm, alignment, bytes);
+}
+
+int posix_memalign(void **memptr, size_t alignment, size_t size) {
+  int ret = 0;
+
+  *memptr = dlmemalign(alignment, size);
+
+  if (*memptr == 0) {
+    ret = ENOMEM;
+  }
+
+  return ret;
 }
 
 void** dlindependent_calloc(size_t n_elements, size_t elem_size,

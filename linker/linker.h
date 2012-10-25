@@ -31,7 +31,8 @@
 
 #include <unistd.h>
 #include <sys/types.h>
-#include <linux/elf.h>
+#include <elf.h>
+#include <sys/exec_elf.h>
 
 #undef PAGE_MASK
 #undef PAGE_SIZE
@@ -83,6 +84,7 @@ typedef struct soinfo soinfo;
 #define FLAG_LINKED     0x00000001
 #define FLAG_ERROR      0x00000002
 #define FLAG_EXE        0x00000004 // The main executable
+#define FLAG_LINKER     0x00000010 // The linker itself
 
 #define SOINFO_NAME_LEN 128
 
@@ -121,14 +123,6 @@ struct soinfo
     Elf32_Rel *rel;
     unsigned rel_count;
 
-#ifdef ANDROID_SH_LINKER
-    Elf32_Rela *plt_rela;
-    unsigned plt_rela_count;
-
-    Elf32_Rela *rela;
-    unsigned rela_count;
-#endif /* ANDROID_SH_LINKER */
-
     unsigned *preinit_array;
     unsigned preinit_array_count;
 
@@ -148,6 +142,12 @@ struct soinfo
 
     unsigned refcount;
     struct link_map linkmap;
+
+    int constructors_called;
+
+    Elf32_Addr gnu_relro_start;
+    unsigned gnu_relro_len;
+
 };
 
 
@@ -175,15 +175,7 @@ extern soinfo libdl_info;
 #define R_386_JUMP_SLOT  7
 #define R_386_RELATIVE   8
 
-#elif defined(ANDROID_SH_LINKER)
-
-#define R_SH_DIR32      1
-#define R_SH_GLOB_DAT   163
-#define R_SH_JUMP_SLOT  164
-#define R_SH_RELATIVE   165
-
-#endif /* ANDROID_*_LINKER */
-
+#endif
 
 #ifndef DT_INIT_ARRAY
 #define DT_INIT_ARRAY      25
@@ -216,11 +208,12 @@ Elf32_Sym *lookup(const char *name, soinfo **found, soinfo *start);
 soinfo *find_containing_library(const void *addr);
 Elf32_Sym *find_containing_symbol(const void *addr, soinfo *si);
 const char *linker_get_error(void);
+void call_constructors_recursive(soinfo *si);
 
 #ifdef ANDROID_ARM_LINKER 
 typedef long unsigned int *_Unwind_Ptr;
 _Unwind_Ptr dl_unwind_find_exidx(_Unwind_Ptr pc, int *pcount);
-#elif defined(ANDROID_X86_LINKER) || defined(ANDROID_SH_LINKER)
+#elif defined(ANDROID_X86_LINKER)
 int dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), void *);
 #endif
 

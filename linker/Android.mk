@@ -10,27 +10,11 @@ LOCAL_SRC_FILES:= \
 	dlfcn.c \
 	debugger.c
 
-ifeq ($(TARGET_ARCH),sh)
-# SH-4A series virtual address range from 0x00000000 to 0x7FFFFFFF.
-LINKER_TEXT_BASE := 0x70000100
-else
-# This is aligned to 4K page boundary so that both GNU ld and gold work.  Gold
-# actually produces a correct binary with starting address 0xB0000100 but the
-# extra objcopy step to rename symbols causes the resulting binary to be misaligned
-# and unloadable.  Increasing the alignment adds an extra 3840 bytes in padding
-# but switching to gold saves about 1M of space.
-LINKER_TEXT_BASE := 0xB0001000
-endif
+LOCAL_LDFLAGS := -shared
 
-# The maximum size set aside for the linker, from
-# LINKER_TEXT_BASE rounded down to a megabyte.
-LINKER_AREA_SIZE := 0x01000000
-
-LOCAL_LDFLAGS := -Wl,-Ttext,$(LINKER_TEXT_BASE)
-
-LOCAL_CFLAGS += -DPRELINK
-LOCAL_CFLAGS += -DLINKER_TEXT_BASE=$(LINKER_TEXT_BASE)
-LOCAL_CFLAGS += -DLINKER_AREA_SIZE=$(LINKER_AREA_SIZE)
+LOCAL_CFLAGS += -fno-stack-protector \
+        -Wstrict-overflow=5 \
+        -fvisibility=hidden
 
 # Set LINKER_DEBUG to either 1 or 0
 #
@@ -49,12 +33,6 @@ LOCAL_CFLAGS += -DANDROID_ARM_LINKER
 else
   ifeq ($(TARGET_ARCH),x86)
     LOCAL_CFLAGS += -DANDROID_X86_LINKER
-  else
-    ifeq ($(TARGET_ARCH),sh)
-      LOCAL_CFLAGS += -DANDROID_SH_LINKER
-    else
-      $(error Unsupported TARGET_ARCH $(TARGET_ARCH))
-    endif
   endif
 endif
 
@@ -75,6 +53,9 @@ LOCAL_STATIC_LIBRARIES := libc_nomalloc
 LOCAL_MODULE_CLASS := EXECUTABLES
 LOCAL_MODULE_SUFFIX := $(TARGET_EXECUTABLE_SUFFIX)
 
+# we don't want crtbegin.o (because we have begin.o), so unset it
+# just for this module
+LOCAL_NO_CRT := true
 
 include $(BUILD_SYSTEM)/dynamic_binary.mk
 
@@ -86,11 +67,3 @@ $(linked_module): $(TARGET_CRTBEGIN_STATIC_O) $(all_objects) $(all_libraries) $(
 #
 # end of BUILD_EXECUTABLE hack
 #
-
-# we don't want crtbegin.o (because we have begin.o), so unset it
-# just for this module
-$(LOCAL_BUILT_MODULE): TARGET_CRTBEGIN_STATIC_O :=
-# This line is not strictly necessary because the dynamic linker is built
-# as a static executable, but it won't hurt if in the future we start
-# building the linker as a dynamic one.
-$(LOCAL_BUILT_MODULE): TARGET_CRTBEGIN_DYNAMIC_O :=

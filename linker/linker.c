@@ -108,7 +108,10 @@ static const char *ldpreload_names[LDPRELOAD_MAX + 1];
 
 static soinfo *preloads[LDPRELOAD_MAX + 1];
 
+#if LINKER_DEBUG
 int debug_verbosity;
+#endif
+
 static int pid;
 
 /* This boolean is set if the program being loaded is setuid */
@@ -313,15 +316,6 @@ static void free_info(soinfo *si)
     freelist = si;
 }
 
-#ifndef LINKER_TEXT_BASE
-#error "linker's makefile must define LINKER_TEXT_BASE"
-#endif
-#ifndef LINKER_AREA_SIZE
-#error "linker's makefile must define LINKER_AREA_SIZE"
-#endif
-#define LINKER_BASE ((LINKER_TEXT_BASE) & 0xfff00000)
-#define LINKER_TOP  (LINKER_BASE + (LINKER_AREA_SIZE))
-
 const char *addr_to_name(unsigned addr)
 {
     soinfo *si;
@@ -330,10 +324,6 @@ const char *addr_to_name(unsigned addr)
         if((addr >= si->base) && (addr < (si->base + si->size))) {
             return si->name;
         }
-    }
-
-    if((addr >= LINKER_BASE) && (addr < LINKER_TOP)){
-        return "linker";
     }
 
     return "";
@@ -354,18 +344,16 @@ _Unwind_Ptr dl_unwind_find_exidx(_Unwind_Ptr pc, int *pcount)
     soinfo *si;
     unsigned addr = (unsigned)pc;
 
-    if ((addr < LINKER_BASE) || (addr >= LINKER_TOP)) {
-        for (si = solist; si != 0; si = si->next){
-            if ((addr >= si->base) && (addr < (si->base + si->size))) {
-                *pcount = si->ARM_exidx_count;
-                return (_Unwind_Ptr)(si->base + (unsigned long)si->ARM_exidx);
-            }
+    for (si = solist; si != 0; si = si->next){
+        if ((addr >= si->base) && (addr < (si->base + si->size))) {
+            *pcount = si->ARM_exidx_count;
+            return (_Unwind_Ptr)(si->base + (unsigned long)si->ARM_exidx);
         }
     }
    *pcount = 0;
     return NULL;
 }
-#elif defined(ANDROID_X86_LINKER) || defined(ANDROID_SH_LINKER)
+#elif defined(ANDROID_X86_LINKER)
 /* Here, we only have to provide a callback to iterate across all the
  * loaded libraries. gcc_eh does the rest. */
 int
@@ -443,7 +431,7 @@ _do_lookup(soinfo *si, const char *name, unsigned *base)
     soinfo *lsi = si;
     int i;
 
-    /* Look for symbols in the local scope first (the object who is
+    /* Look for symbols in the local scope (the object who is
      * searching). This happens with C++ templates on i386 for some
      * reason.
      *
@@ -452,6 +440,7 @@ _do_lookup(soinfo *si, const char *name, unsigned *base)
      * dynamic linking.  Some systems return the first definition found
      * and some the first non-weak definition.   This is system dependent.
      * Here we return the first definition found for simplicity.  */
+
     s = _elf_lookup(si, elf_hash, name);
     if(s != NULL)
         goto done;
@@ -707,7 +696,11 @@ verify_elf_object(void *base, const char *name)
     if (hdr->e_ident[EI_MAG3] != ELFMAG3) return -1;
 
     /* TODO: Should we verify anything else in the header? */
-
+#ifdef ANDROID_ARM_LINKER
+    if (hdr->e_machine != EM_ARM) return -1;
+#elif defined(ANDROID_X86_LINKER)
+    if (hdr->e_machine != EM_386) return -1;
+#endif
     return 0;
 }
 
@@ -788,16 +781,15 @@ get_lib_extents(int fd, const char *name, void *__hdr, unsigned *total_sz)
     return (unsigned)req_base;
 }
 
-/* alloc_mem_region
+/* reserve_mem_region
  *
  *     This function reserves a chunk of memory to be used for mapping in
- *     the shared library. We reserve the entire memory region here, and
+ *     a prelinked shared library. We reserve the entire memory region here, and
  *     then the rest of the linker will relocate the individual loadable
  *     segments into the correct locations within this memory range.
  *
  * Args:
- *     si->base: The requested base of the allocation. If 0, a sane one will be
- *               chosen in the range LIBBASE <= base < LIBLAST.
+ *     si->base: The requested base of the allocation.
  *     si->size: The size of the allocation.
  *
  * Returns:
@@ -807,7 +799,7 @@ get_lib_extents(int fd, const char *name, void *__hdr, unsigned *total_sz)
 
 static int reserve_mem_region(soinfo *si)
 {
-    void *base = mmap((void *)si->base, si->size, PROT_READ | PROT_EXEC,
+    void *base = mmap((void *)si->base, si->size, PROT_NONE,
                       MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) {
         DL_ERR("%5d can NOT map (%sprelinked) library '%s' at 0x%08x "
@@ -825,8 +817,7 @@ static int reserve_mem_region(soinfo *si)
     return 0;
 }
 
-static int
-alloc_mem_region(soinfo *si)
+static int alloc_mem_region(soinfo *si)
 {
     if (si->base) {
         /* Attempt to mmap a prelinked library. */
@@ -837,7 +828,7 @@ alloc_mem_region(soinfo *si)
        allocator.
     */
 
-    void *base = mmap(NULL, si->size, PROT_READ | PROT_EXEC,
+    void *base = mmap(NULL, si->size, PROT_NONE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) {
         DL_ERR("%5d mmap of library '%s' failed: %d (%s)\n",
@@ -879,10 +870,10 @@ load_segments(int fd, void *header, soinfo *si)
 {
     Elf32_Ehdr *ehdr = (Elf32_Ehdr *)header;
     Elf32_Phdr *phdr = (Elf32_Phdr *)((unsigned char *)header + ehdr->e_phoff);
-    unsigned char *base = (unsigned char *)si->base;
+    Elf32_Addr base = (Elf32_Addr) si->base;
     int cnt;
     unsigned len;
-    unsigned char *tmp;
+    Elf32_Addr tmp;
     unsigned char *pbase;
     unsigned char *extra_base;
     unsigned extra_len;
@@ -906,7 +897,7 @@ load_segments(int fd, void *header, soinfo *si)
             TRACE("[ %d - Trying to load segment from '%s' @ 0x%08x "
                   "(0x%08x). p_vaddr=0x%08x p_offset=0x%08x ]\n", pid, si->name,
                   (unsigned)tmp, len, phdr->p_vaddr, phdr->p_offset);
-            pbase = mmap(tmp, len, PFLAGS_TO_PROT(phdr->p_flags),
+            pbase = mmap((void *)tmp, len, PFLAGS_TO_PROT(phdr->p_flags),
                          MAP_PRIVATE | MAP_FIXED, fd,
                          phdr->p_offset & (~PAGE_MASK));
             if (pbase == MAP_FAILED) {
@@ -948,7 +939,7 @@ load_segments(int fd, void *header, soinfo *si)
              *                  |                     |
              *                 _+---------------------+  page boundary
              */
-            tmp = (unsigned char *)(((unsigned)pbase + len + PAGE_SIZE - 1) &
+            tmp = (Elf32_Addr)(((unsigned)pbase + len + PAGE_SIZE - 1) &
                                     (~PAGE_MASK));
             if (tmp < (base + phdr->p_vaddr + phdr->p_memsz)) {
                 extra_len = base + phdr->p_vaddr + phdr->p_memsz - tmp;
@@ -1003,6 +994,17 @@ load_segments(int fd, void *header, soinfo *si)
             DEBUG_DUMP_PHDR(phdr, "PT_DYNAMIC", pid);
             /* this segment contains the dynamic linking information */
             si->dynamic = (unsigned *)(base + phdr->p_vaddr);
+        } else if (phdr->p_type == PT_GNU_RELRO) {
+            if ((phdr->p_vaddr >= si->size)
+                    || ((phdr->p_vaddr + phdr->p_memsz) > si->size)
+                    || ((base + phdr->p_vaddr + phdr->p_memsz) < base)) {
+                DL_ERR("%d invalid GNU_RELRO in '%s' "
+                       "p_vaddr=0x%08x p_memsz=0x%08x", pid, si->name,
+                       phdr->p_vaddr, phdr->p_memsz);
+                goto fail;
+            }
+            si->gnu_relro_start = (Elf32_Addr) (base + phdr->p_vaddr);
+            si->gnu_relro_len = (unsigned) phdr->p_memsz;
         } else {
 #ifdef ANDROID_ARM_LINKER
             if (phdr->p_type == PT_ARM_EXIDX) {
@@ -1224,10 +1226,29 @@ unsigned unload_library(soinfo *si)
         TRACE("%5d unloading '%s'\n", pid, si->name);
         call_destructors(si);
 
+        /*
+         * Make sure that we undo the PT_GNU_RELRO protections we added
+         * in link_image. This is needed to undo the DT_NEEDED hack below.
+         */
+        if ((si->gnu_relro_start != 0) && (si->gnu_relro_len != 0)) {
+            Elf32_Addr start = (si->gnu_relro_start & ~PAGE_MASK);
+            unsigned len = (si->gnu_relro_start - start) + si->gnu_relro_len;
+            if (mprotect((void *) start, len, PROT_READ | PROT_WRITE) < 0)
+                DL_ERR("%5d %s: could not undo GNU_RELRO protections. "
+                       "Expect a crash soon. errno=%d (%s)",
+                       pid, si->name, errno, strerror(errno));
+
+        }
+
         for(d = si->dynamic; *d; d += 2) {
             if(d[0] == DT_NEEDED){
                 soinfo *lsi = (soinfo *)d[1];
+
+                // The next line will segfault if the we don't undo the
+                // PT_GNU_RELRO protections (see comments above and in
+                // link_image().
                 d[1] = 0;
+
                 if (validate_soinfo(lsi)) {
                     TRACE("%5d %s needs to unload %s\n", pid,
                           si->name, lsi->name);
@@ -1458,101 +1479,6 @@ static int reloc_library(soinfo *si, Elf32_Rel *rel, unsigned count)
     return 0;
 }
 
-#if defined(ANDROID_SH_LINKER)
-static int reloc_library_a(soinfo *si, Elf32_Rela *rela, unsigned count)
-{
-    Elf32_Sym *symtab = si->symtab;
-    const char *strtab = si->strtab;
-    Elf32_Sym *s;
-    unsigned base;
-    Elf32_Rela *start = rela;
-    unsigned idx;
-
-    for (idx = 0; idx < count; ++idx) {
-        unsigned type = ELF32_R_TYPE(rela->r_info);
-        unsigned sym = ELF32_R_SYM(rela->r_info);
-        unsigned reloc = (unsigned)(rela->r_offset + si->base);
-        unsigned sym_addr = 0;
-        char *sym_name = NULL;
-
-        DEBUG("%5d Processing '%s' relocation at index %d\n", pid,
-              si->name, idx);
-        if(sym != 0) {
-            sym_name = (char *)(strtab + symtab[sym].st_name);
-            s = _do_lookup(si, sym_name, &base);
-            if(s == 0) {
-                DL_ERR("%5d cannot locate '%s'...", pid, sym_name);
-                return -1;
-            }
-#if 0
-            if((base == 0) && (si->base != 0)){
-                    /* linking from libraries to main image is bad */
-                DL_ERR("%5d cannot locate '%s'...",
-                       pid, strtab + symtab[sym].st_name);
-                return -1;
-            }
-#endif
-            if ((s->st_shndx == SHN_UNDEF) && (s->st_value != 0)) {
-                DL_ERR("%5d In '%s', shndx=%d && value=0x%08x. We do not "
-                      "handle this yet", pid, si->name, s->st_shndx,
-                      s->st_value);
-                return -1;
-            }
-            sym_addr = (unsigned)(s->st_value + base);
-            COUNT_RELOC(RELOC_SYMBOL);
-        } else {
-            s = 0;
-        }
-
-/* TODO: This is ugly. Split up the relocations by arch into
- * different files.
- */
-        switch(type){
-        case R_SH_JUMP_SLOT:
-            COUNT_RELOC(RELOC_ABSOLUTE);
-            MARK(rela->r_offset);
-            TRACE_TYPE(RELO, "%5d RELO JMP_SLOT %08x <- %08x %s\n", pid,
-                       reloc, sym_addr, sym_name);
-            *((unsigned*)reloc) = sym_addr;
-            break;
-        case R_SH_GLOB_DAT:
-            COUNT_RELOC(RELOC_ABSOLUTE);
-            MARK(rela->r_offset);
-            TRACE_TYPE(RELO, "%5d RELO GLOB_DAT %08x <- %08x %s\n", pid,
-                       reloc, sym_addr, sym_name);
-            *((unsigned*)reloc) = sym_addr;
-            break;
-        case R_SH_DIR32:
-            COUNT_RELOC(RELOC_ABSOLUTE);
-            MARK(rela->r_offset);
-            TRACE_TYPE(RELO, "%5d RELO DIR32 %08x <- %08x %s\n", pid,
-                       reloc, sym_addr, sym_name);
-            *((unsigned*)reloc) += sym_addr;
-            break;
-        case R_SH_RELATIVE:
-            COUNT_RELOC(RELOC_RELATIVE);
-            MARK(rela->r_offset);
-            if(sym){
-                DL_ERR("%5d odd RELATIVE form...", pid);
-                return -1;
-            }
-            TRACE_TYPE(RELO, "%5d RELO RELATIVE %08x <- +%08x\n", pid,
-                       reloc, si->base);
-            *((unsigned*)reloc) += si->base;
-            break;
-
-        default:
-            DL_ERR("%5d unknown reloc type %d @ %p (%d)",
-                  pid, type, rela, (int) (rela - start));
-            return -1;
-        }
-        rela++;
-    }
-    return 0;
-}
-#endif /* ANDROID_SH_LINKER */
-
-
 /* Please read the "Initialization and Termination functions" functions.
  * of the linker design note in bionic/linker/README.TXT to understand
  * what the following code is doing.
@@ -1590,8 +1516,24 @@ static void call_array(unsigned *ctor, int count, int reverse)
     }
 }
 
-static void call_constructors(soinfo *si)
+void call_constructors_recursive(soinfo *si)
 {
+    if (si->constructors_called)
+        return;
+
+    // Set this before actually calling the constructors, otherwise it doesn't
+    // protect against recursive constructor calls. One simple example of
+    // constructor recursion is the libc debug malloc, which is implemented in
+    // libc_malloc_debug_leak.so:
+    // 1. The program depends on libc, so libc's constructor is called here.
+    // 2. The libc constructor calls dlopen() to load libc_malloc_debug_leak.so.
+    // 3. dlopen() calls call_constructors_recursive() with the newly created
+    //    soinfo for libc_malloc_debug_leak.so.
+    // 4. The debug so depends on libc, so call_constructors_recursive() is
+    //    called again with the libc soinfo. If it doesn't trigger the early-
+    //    out above, the libc constructor will be called again (recursively!).
+    si->constructors_called = 1;
+
     if (si->flags & FLAG_EXE) {
         TRACE("[ %5d Calling preinit_array @ 0x%08x [%d] for '%s' ]\n",
               pid, (unsigned)si->preinit_array, si->preinit_array_count,
@@ -1603,6 +1545,21 @@ static void call_constructors(soinfo *si)
             DL_ERR("%5d Shared library '%s' has a preinit_array table @ 0x%08x."
                    " This is INVALID.", pid, si->name,
                    (unsigned)si->preinit_array);
+        }
+    }
+
+    if (si->dynamic) {
+        unsigned *d;
+        for(d = si->dynamic; *d; d += 2) {
+            if(d[0] == DT_NEEDED){
+                soinfo* lsi = (soinfo *)d[1];
+                if (!validate_soinfo(lsi)) {
+                    DL_ERR("%5d bad DT_NEEDED pointer in %s",
+                           pid, si->name);
+                } else {
+                    call_constructors_recursive(lsi);
+                }
+            }
         }
     }
 
@@ -1619,8 +1576,8 @@ static void call_constructors(soinfo *si)
         call_array(si->init_array, si->init_array_count, 0);
         TRACE("[ %5d Done calling init_array for '%s' ]\n", pid, si->name);
     }
-}
 
+}
 
 static void call_destructors(soinfo *si)
 {
@@ -1719,10 +1676,10 @@ static int link_image(soinfo *si, unsigned wr_offset)
     DEBUG("%5d si->base = 0x%08x si->flags = 0x%08x\n", pid,
           si->base, si->flags);
 
-    if (si->flags & FLAG_EXE) {
+    if (si->flags & (FLAG_EXE | FLAG_LINKER)) {
         /* Locate the needed program segments (DYNAMIC/ARM_EXIDX) for
-         * linkage info if this is the executable. If this was a
-         * dynamic lib, that would have been done at load time.
+         * linkage info if this is the executable or the linker itself. 
+         * If this was a dynamic lib, that would have been done at load time.
          *
          * TODO: It's unfortunate that small pieces of this are
          * repeated from the load_library routine. Refactor this just
@@ -1741,16 +1698,17 @@ static int link_image(soinfo *si, unsigned wr_offset)
             if (phdr->p_type == PT_LOAD) {
                 /* For the executable, we use the si->size field only in
                    dl_unwind_find_exidx(), so the meaning of si->size
-                   is not the size of the executable; it is the last
-                   virtual address of the loadable part of the executable;
-                   since si->base == 0 for an executable, we use the
-                   range [0, si->size) to determine whether a PC value
-                   falls within the executable section.  Of course, if
-                   a value is below phdr->p_vaddr, it's not in the
-                   executable section, but a) we shouldn't be asking for
-                   such a value anyway, and b) if we have to provide
-                   an EXIDX for such a value, then the executable's
-                   EXIDX is probably the better choice.
+                   is not the size of the executable; it is the distance
+                   between the load location of the executable and the last
+                   address of the loadable part of the executable.
+                   We use the range [si->base, si->base + si->size) to
+                   determine whether a PC value falls within the executable
+                   section. Of course, if a value is between si->base and
+                   (si->base + phdr->p_vaddr), it's not in the executable
+                   section, but a) we shouldn't be asking for such a value
+                   anyway, and b) if we have to provide an EXIDX for such a
+                   value, then the executable's EXIDX is probably the better
+                   choice.
                 */
                 DEBUG_DUMP_PHDR(phdr, "PT_LOAD", pid);
                 if (phdr->p_vaddr + phdr->p_memsz > si->size)
@@ -1760,12 +1718,20 @@ static int link_image(soinfo *si, unsigned wr_offset)
                 if (!(phdr->p_flags & PF_W)) {
                     unsigned _end;
 
-                    if (phdr->p_vaddr < si->wrprotect_start)
-                        si->wrprotect_start = phdr->p_vaddr;
-                    _end = (((phdr->p_vaddr + phdr->p_memsz + PAGE_SIZE - 1) &
+                    if (si->base + phdr->p_vaddr < si->wrprotect_start)
+                        si->wrprotect_start = si->base + phdr->p_vaddr;
+                    _end = (((si->base + phdr->p_vaddr + phdr->p_memsz + PAGE_SIZE - 1) &
                              (~PAGE_MASK)));
                     if (_end > si->wrprotect_end)
                         si->wrprotect_end = _end;
+                    /* Make the section writable just in case we'll have to
+                     * write to it during relocation (i.e. text segment).
+                     * However, we will remember what range of addresses
+                     * should be write protected.
+                     */
+                    mprotect((void *) (si->base + phdr->p_vaddr),
+                             phdr->p_memsz,
+                             PFLAGS_TO_PROT(phdr->p_flags) | PROT_WRITE);
                 }
             } else if (phdr->p_type == PT_DYNAMIC) {
                 if (si->dynamic != (unsigned *)-1) {
@@ -1777,6 +1743,17 @@ static int link_image(soinfo *si, unsigned wr_offset)
                 }
                 DEBUG_DUMP_PHDR(phdr, "PT_DYNAMIC", pid);
                 si->dynamic = (unsigned *) (si->base + phdr->p_vaddr);
+            } else if (phdr->p_type == PT_GNU_RELRO) {
+                if ((phdr->p_vaddr >= si->size)
+                        || ((phdr->p_vaddr + phdr->p_memsz) > si->size)
+                        || ((si->base + phdr->p_vaddr + phdr->p_memsz) < si->base)) {
+                    DL_ERR("%d invalid GNU_RELRO in '%s' "
+                           "p_vaddr=0x%08x p_memsz=0x%08x", pid, si->name,
+                           phdr->p_vaddr, phdr->p_memsz);
+                    goto fail;
+                }
+                si->gnu_relro_start = (Elf32_Addr) (si->base + phdr->p_vaddr);
+                si->gnu_relro_len = (unsigned) phdr->p_memsz;
             }
         }
     }
@@ -1804,40 +1781,24 @@ static int link_image(soinfo *si, unsigned wr_offset)
         case DT_SYMTAB:
             si->symtab = (Elf32_Sym *) (si->base + *d);
             break;
-#if !defined(ANDROID_SH_LINKER)
         case DT_PLTREL:
             if(*d != DT_REL) {
                 DL_ERR("DT_RELA not supported");
                 goto fail;
             }
             break;
-#endif
-#ifdef ANDROID_SH_LINKER
-        case DT_JMPREL:
-            si->plt_rela = (Elf32_Rela*) (si->base + *d);
-            break;
-        case DT_PLTRELSZ:
-            si->plt_rela_count = *d / sizeof(Elf32_Rela);
-            break;
-#else
         case DT_JMPREL:
             si->plt_rel = (Elf32_Rel*) (si->base + *d);
             break;
         case DT_PLTRELSZ:
             si->plt_rel_count = *d / 8;
             break;
-#endif
         case DT_REL:
             si->rel = (Elf32_Rel*) (si->base + *d);
             break;
         case DT_RELSZ:
             si->rel_count = *d / 8;
             break;
-#ifdef ANDROID_SH_LINKER
-        case DT_RELASZ:
-            si->rela_count = *d / sizeof(Elf32_Rela);
-             break;
-#endif
         case DT_PLTGOT:
             /* Save this in case we decide to do lazy binding. We don't yet. */
             si->plt_got = (unsigned *)(si->base + *d);
@@ -1846,15 +1807,9 @@ static int link_image(soinfo *si, unsigned wr_offset)
             // Set the DT_DEBUG entry to the addres of _r_debug for GDB
             *d = (int) &_r_debug;
             break;
-#ifdef ANDROID_SH_LINKER
-        case DT_RELA:
-            si->rela = (Elf32_Rela *) (si->base + *d);
-            break;
-#else
          case DT_RELA:
             DL_ERR("%5d DT_RELA not supported", pid);
             goto fail;
-#endif
         case DT_INIT:
             si->init_func = (void (*)(void))(si->base + *d);
             DEBUG("%5d %s constructors (init func) found at %p\n",
@@ -1940,7 +1895,7 @@ static int link_image(soinfo *si, unsigned wr_offset)
                of the DT_NEEDED entry itself, so that we can retrieve the
                soinfo directly later from the dynamic segment.  This is a hack,
                but it allows us to map from DT_NEEDED to soinfo efficiently
-               later on when we resolve relocations, trying to look up a symgol
+               later on when we resolve relocations, trying to look up a symbol
                with dlsym().
             */
             d[1] = (unsigned)lsi;
@@ -1958,19 +1913,6 @@ static int link_image(soinfo *si, unsigned wr_offset)
         if(reloc_library(si, si->rel, si->rel_count))
             goto fail;
     }
-
-#ifdef ANDROID_SH_LINKER
-    if(si->plt_rela) {
-        DEBUG("[ %5d relocating %s plt ]\n", pid, si->name );
-        if(reloc_library_a(si, si->plt_rela, si->plt_rela_count))
-            goto fail;
-    }
-    if(si->rela) {
-        DEBUG("[ %5d relocating %s ]\n", pid, si->name );
-        if(reloc_library_a(si, si->rela, si->rela_count))
-            goto fail;
-    }
-#endif /* ANDROID_SH_LINKER */
 
     si->flags |= FLAG_LINKED;
     DEBUG("[ %5d finished linking %s ]\n", pid, si->name);
@@ -2001,6 +1943,16 @@ static int link_image(soinfo *si, unsigned wr_offset)
     }
 #endif
 
+    if (si->gnu_relro_start != 0 && si->gnu_relro_len != 0) {
+        Elf32_Addr start = (si->gnu_relro_start & ~PAGE_MASK);
+        unsigned len = (si->gnu_relro_start - start) + si->gnu_relro_len;
+        if (mprotect((void *) start, len, PROT_READ) < 0) {
+            DL_ERR("%5d GNU_RELRO mprotect of library '%s' failed: %d (%s)\n",
+                   pid, si->name, errno, strerror(errno));
+            goto fail;
+        }
+    }
+
     /* If this is a SET?ID program, dup /dev/null to opened stdin,
        stdout and stderr to close a security hole described in:
 
@@ -2010,7 +1962,6 @@ static int link_image(soinfo *si, unsigned wr_offset)
     if (program_is_setuid)
         nullify_closed_stdio ();
     notify_gdb_of_load(si);
-    call_constructors(si);
     return 0;
 
 fail:
@@ -2066,38 +2017,23 @@ static void parse_preloads(const char *path, char *delim)
     }
 }
 
-int main(int argc, char **argv)
-{
-    return 0;
-}
-
-#define ANDROID_TLS_SLOTS  BIONIC_TLS_SLOTS
-
-static void * __tls_area[ANDROID_TLS_SLOTS];
-
-unsigned __linker_init(unsigned **elfdata)
+/*
+ * This code is called after the linker has linked itself and
+ * fixed it's own GOT. It is safe to make references to externs
+ * and other non-local data at this point.
+ */
+static unsigned __linker_init_post_relocation(unsigned **elfdata)
 {
     static soinfo linker_soinfo;
 
     int argc = (int) *elfdata;
     char **argv = (char**) (elfdata + 1);
     unsigned *vecs = (unsigned*) (argv + argc + 1);
+    unsigned *v;
     soinfo *si;
     struct link_map * map;
     const char *ldpath_env = NULL;
     const char *ldpreload_env = NULL;
-
-    /* Setup a temporary TLS area that is used to get a working
-     * errno for system calls.
-     */
-    __set_tls(__tls_area);
-
-    pid = getpid();
-
-#if TIMING
-    struct timeval t0, t1;
-    gettimeofday(&t0, 0);
-#endif
 
     /* NOTE: we store the elfdata pointer on a special location
      *       of the temporary TLS area in order to pass it to
@@ -2107,14 +2043,32 @@ unsigned __linker_init(unsigned **elfdata)
      *       to point to a different location to ensure that no other
      *       shared library constructor can access it.
      */
-    __tls_area[TLS_SLOT_BIONIC_PREINIT] = elfdata;
+    __libc_init_tls(elfdata);
 
-    /* Are we setuid? */
-    program_is_setuid = (getuid() != geteuid()) || (getgid() != getegid());
+    pid = getpid();
+
+#if TIMING
+    struct timeval t0, t1;
+    gettimeofday(&t0, 0);
+#endif
 
     /* Initialize environment functions, and get to the ELF aux vectors table */
     vecs = linker_env_init(vecs);
 
+    /* Check auxv for AT_SECURE first to see if program is setuid, setgid,
+       has file caps, or caused a SELinux/AppArmor domain transition. */
+    for (v = vecs; v[0]; v += 2) {
+        if (v[0] == AT_SECURE) {
+            /* kernel told us whether to enable secure mode */
+            program_is_setuid = v[1];
+            goto sanitize;
+        }
+    }
+
+    /* Kernel did not provide AT_SECURE - fall back on legacy test. */
+    program_is_setuid = (getuid() != geteuid()) || (getgid() != getegid());
+
+sanitize:
     /* Sanitize environment if we're loading a setuid program */
     if (program_is_setuid)
         linker_env_secure();
@@ -2123,10 +2077,12 @@ unsigned __linker_init(unsigned **elfdata)
 
     /* Get a few environment variables */
     {
+#if LINKER_DEBUG
         const char* env;
         env = linker_env_get("DEBUG"); /* XXX: TODO: Change to LD_DEBUG */
         if (env)
             debug_verbosity = atoi(env);
+#endif
 
         /* Normally, these are cleaned by linker_env_secure, but the test
          * against program_is_setuid doesn't cost us anything */
@@ -2183,11 +2139,24 @@ unsigned __linker_init(unsigned **elfdata)
         vecs += 2;
     }
 
+    /* Compute the value of si->base. We can't rely on the fact that
+     * the first entry is the PHDR because this will not be true
+     * for certain executables (e.g. some in the NDK unit test suite)
+     */
+    int nn;
     si->base = 0;
+    for ( nn = 0; nn < si->phnum; nn++ ) {
+        if (si->phdr[nn].p_type == PT_PHDR) {
+            si->base = (Elf32_Addr) si->phdr - si->phdr[nn].p_vaddr;
+            break;
+        }
+    }
     si->dynamic = (unsigned *)-1;
     si->wrprotect_start = 0xffffffff;
     si->wrprotect_end = 0;
     si->refcount = 1;
+    si->gnu_relro_start = 0;
+    si->gnu_relro_len = 0;
 
         /* Use LD_LIBRARY_PATH if we aren't setuid/setgid */
     if (ldpath_env)
@@ -2203,6 +2172,8 @@ unsigned __linker_init(unsigned **elfdata)
         write(2, errmsg, sizeof(errmsg));
         exit(-1);
     }
+
+    call_constructors_recursive(si);
 
 #if ALLOW_SYMBOLS_FROM_MAIN
     /* Set somain after we've loaded all the libraries in order to prevent
@@ -2251,4 +2222,72 @@ unsigned __linker_init(unsigned **elfdata)
     TRACE("[ %5d Ready to execute '%s' @ 0x%08x ]\n", pid, si->name,
           si->entry);
     return si->entry;
+}
+
+/*
+ * Find the value of AT_BASE passed to us by the kernel. This is the load
+ * location of the linker.
+ */
+static unsigned find_linker_base(unsigned **elfdata) {
+    int argc = (int) *elfdata;
+    char **argv = (char**) (elfdata + 1);
+    unsigned *vecs = (unsigned*) (argv + argc + 1);
+    while (vecs[0] != 0) {
+        vecs++;
+    }
+
+    /* The end of the environment block is marked by two NULL pointers */
+    vecs++;
+
+    while(vecs[0]) {
+        if (vecs[0] == AT_BASE) {
+            return vecs[1];
+        }
+        vecs += 2;
+    }
+
+    return 0; // should never happen
+}
+
+/*
+ * This is the entry point for the linker, called from begin.S. This
+ * method is responsible for fixing the linker's own relocations, and
+ * then calling __linker_init_post_relocation().
+ *
+ * Because this method is called before the linker has fixed it's own
+ * relocations, any attempt to reference an extern variable, extern
+ * function, or other GOT reference will generate a segfault.
+ */
+unsigned __linker_init(unsigned **elfdata) {
+    unsigned linker_addr = find_linker_base(elfdata);
+    Elf32_Ehdr *elf_hdr = (Elf32_Ehdr *) linker_addr;
+    Elf32_Phdr *phdr =
+        (Elf32_Phdr *)((unsigned char *) linker_addr + elf_hdr->e_phoff);
+
+    soinfo linker_so;
+    memset(&linker_so, 0, sizeof(soinfo));
+
+    linker_so.base = linker_addr;
+    linker_so.dynamic = (unsigned *) -1;
+    linker_so.phdr = phdr;
+    linker_so.phnum = elf_hdr->e_phnum;
+    linker_so.flags |= FLAG_LINKER;
+    linker_so.wrprotect_start = 0xffffffff;
+    linker_so.wrprotect_end = 0;
+    linker_so.gnu_relro_start = 0;
+    linker_so.gnu_relro_len = 0;
+
+    if (link_image(&linker_so, 0)) {
+        // It would be nice to print an error message, but if the linker
+        // can't link itself, there's no guarantee that we'll be able to
+        // call write() (because it involves a GOT reference).
+        //
+        // This situation should never occur unless the linker itself
+        // is corrupt.
+        exit(-1);
+    }
+
+    // We have successfully fixed our own relocations. It's safe to run
+    // the main part of the linker now.
+    return __linker_init_post_relocation(elfdata);
 }

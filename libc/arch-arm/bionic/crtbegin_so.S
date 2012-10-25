@@ -26,6 +26,8 @@
  * SUCH DAMAGE.
  */
 
+#include <machine/asm.h>
+
 # Implement static C++ destructors when the shared
 # library is unloaded through dlclose().
 #
@@ -33,10 +35,11 @@
 # in the .fini_array. See 3.3.5.3.C of C++ ABI
 # standard.
 #
-__on_dlclose:
+ENTRY(__on_dlclose)
         adr     r0, 0f
         ldr     r0, [r0]
         b       __cxa_finalize
+END(__on_dlclose)
 
 0:
         .long   __dso_handle
